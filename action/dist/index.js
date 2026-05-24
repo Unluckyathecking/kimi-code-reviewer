@@ -52848,7 +52848,7 @@ class KimiClient {
     timeout;
     constructor(config) {
         this.apiKey = config.apiKey;
-        this.model = config.model ?? 'kimi-k2.5';
+        this.model = config.model ?? 'kimi-for-coding';
         this.baseUrl = config.baseUrl ?? process.env.KIMI_BASE_URL ?? 'https://api.kimi.com/coding/v1';
         this.maxTokens = config.maxTokens ?? 16384;
         this.temperature = config.temperature ?? 1;
@@ -52870,6 +52870,7 @@ class KimiClient {
                 headers: {
                     'Content-Type': 'application/json',
                     Authorization: `Bearer ${this.apiKey}`,
+                    'User-Agent': 'kimi-code-reviewer/0.1.0 (github-action; +https://github.com/Unluckyathecking/kimi-code-reviewer)',
                 },
                 body: JSON.stringify(body),
                 signal: controller.signal,
@@ -52899,7 +52900,7 @@ var dist = __nccwpck_require__(8815);
 
 const reviewConfigSchema = objectType({
     language: enumType(['en', 'zh-TW', 'zh-CN', 'ja', 'ko']).default('en'),
-    model: stringType().default('kimi-k2.5'),
+    model: stringType().default('kimi-for-coding'),
     review: objectType({
         auto: objectType({
             enabled: booleanType().default(true),
@@ -52963,7 +52964,7 @@ const reviewConfigSchema = objectType({
 ;// CONCATENATED MODULE: ./src/config/defaults.ts
 const DEFAULT_CONFIG = {
     language: 'en',
-    model: 'kimi-k2.5',
+    model: 'kimi-for-coding',
     review: {
         auto: {
             enabled: true,
@@ -53062,8 +53063,9 @@ async function run() {
         // Get inputs
         const kimiApiKey = core.getInput('kimi_api_key', { required: true });
         const githubToken = core.getInput('github_token');
-        const model = core.getInput('model') || 'kimi-k2.5';
-        const failOn = (core.getInput('fail_on') || 'critical');
+        const model = core.getInput('model') || 'kimi-for-coding';
+        const baseUrl = core.getInput('base_url') || undefined;
+        const failOn = (core.getInput('fail_on') || 'warning');
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
         // Only run on pull requests
@@ -53084,7 +53086,7 @@ async function run() {
         // Override failOn from action input
         config.review.failOn = failOn;
         // Create Kimi client
-        const kimi = new KimiClient({ apiKey: kimiApiKey, model });
+        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
         // Run review
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
         const result = await orchestrator.reviewPullRequest({

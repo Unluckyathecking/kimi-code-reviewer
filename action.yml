@@ -8,16 +8,20 @@ branding:
 
 inputs:
   kimi_api_key:
-    description: 'Moonshot AI API key (from platform.moonshot.ai)'
+    description: 'Kimi API key from kimi.com/code/console (sk-kimi-...) or Moonshot Platform (sk-...)'
     required: true
   github_token:
     description: 'GitHub token for API access'
     required: false
     default: ${{ github.token }}
   model:
-    description: 'Kimi model to use (kimi-k2.5 for 256K context)'
+    description: 'Kimi model ID — use kimi-for-coding against api.kimi.com/coding/v1'
     required: false
-    default: 'kimi-k2.5'
+    default: 'kimi-for-coding'
+  base_url:
+    description: 'Kimi API base URL. Default api.kimi.com/coding/v1 (Kimi For Coding).'
+    required: false
+    default: 'https://api.kimi.com/coding/v1'
   language:
     description: 'Review comment language (en, zh-TW, zh-CN, ja, ko)'
     required: false

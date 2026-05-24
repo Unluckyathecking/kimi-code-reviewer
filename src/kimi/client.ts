@@ -36,7 +36,7 @@ export class KimiClient {
 
   constructor(config: KimiClientConfig) {
     this.apiKey = config.apiKey;
-    this.model = config.model ?? 'kimi-k2.5';
+    this.model = config.model ?? 'kimi-for-coding';
     this.baseUrl = config.baseUrl ?? process.env.KIMI_BASE_URL ?? 'https://api.kimi.com/coding/v1';
     this.maxTokens = config.maxTokens ?? 16384;
     this.temperature = config.temperature ?? 1;
@@ -64,6 +64,7 @@ export class KimiClient {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${this.apiKey}`,
+          'User-Agent': 'kimi-code-reviewer/0.1.0 (github-action; +https://github.com/Unluckyathecking/kimi-code-reviewer)',
         },
         body: JSON.stringify(body),
         signal: controller.signal,

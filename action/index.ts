@@ -10,8 +10,9 @@ async function run(): Promise<void> {
     // Get inputs
     const kimiApiKey = core.getInput('kimi_api_key', { required: true });
     const githubToken = core.getInput('github_token');
-    const model = core.getInput('model') || 'kimi-k2.5';
-    const failOn = (core.getInput('fail_on') || 'critical') as 'critical' | 'warning' | 'never';
+    const model = core.getInput('model') || 'kimi-for-coding';
+    const baseUrl = core.getInput('base_url') || undefined;
+    const failOn = (core.getInput('fail_on') || 'warning') as 'critical' | 'warning' | 'never';
 
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
@@ -39,7 +40,7 @@ async function run(): Promise<void> {
     config.review.failOn = failOn;
 
     // Create Kimi client
-    const kimi = new KimiClient({ apiKey: kimiApiKey, model });
+    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
 
     // Run review
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);
