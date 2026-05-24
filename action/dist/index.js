@@ -52839,6 +52839,7 @@ class ReviewOrchestrator {
 ;// CONCATENATED MODULE: ./src/kimi/client.ts
 
 
+const USER_AGENT = 'kimi-code-reviewer/0.1.0 (github-action; +https://github.com/Unluckyathecking/kimi-code-reviewer)';
 class KimiClient {
     baseUrl;
     apiKey;
@@ -52855,22 +52856,32 @@ class KimiClient {
         this.timeout = config.timeout ?? 300_000;
     }
     async chatCompletion(params) {
+        const { system, conversation } = splitSystemMessages(params.messages);
+        if (conversation.length === 0) {
+            throw new KimiApiError('No non-system messages to send', 400);
+        }
+        if (conversation[0].role !== 'user') {
+            throw new KimiApiError(`First non-system message must be from 'user' (got '${conversation[0].role}')`, 400);
+        }
         const body = {
             model: this.model,
-            messages: params.messages,
             max_tokens: this.maxTokens,
             temperature: this.temperature,
-            ...(params.responseFormat && { response_format: params.responseFormat }),
+            messages: conversation.map((m) => ({ role: m.role, content: m.content })),
         };
+        if (system) {
+            body.system = system;
+        }
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeout);
         try {
-            const res = await fetch(`${this.baseUrl}/chat/completions`, {
+            const res = await fetch(`${this.baseUrl}/messages`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     Authorization: `Bearer ${this.apiKey}`,
-                    'User-Agent': 'kimi-code-reviewer/0.1.0 (github-action; +https://github.com/Unluckyathecking/kimi-code-reviewer)',
+                    'anthropic-version': '2023-06-01',
+                    'User-Agent': USER_AGENT,
                 },
                 body: JSON.stringify(body),
                 signal: controller.signal,
@@ -52880,18 +52891,54 @@ class KimiClient {
                 throw new KimiApiError(`Kimi API error: ${res.status} ${res.statusText}`, res.status, errorBody);
             }
             const data = (await res.json());
+            const text = data.content
+                .filter((b) => b.type === 'text')
+                .map((b) => b.text)
+                .join('');
+            const inputTokens = data.usage.input_tokens ?? 0;
+            const outputTokens = data.usage.output_tokens ?? 0;
+            const cachedTokens = data.usage.cache_read_input_tokens ?? 0;
             logger.info({
                 model: this.model,
-                promptTokens: data.usage.prompt_tokens,
-                completionTokens: data.usage.completion_tokens,
-                cachedTokens: data.usage.cached_tokens ?? 0,
+                promptTokens: inputTokens,
+                completionTokens: outputTokens,
+                cachedTokens,
+                stopReason: data.stop_reason,
             }, 'Kimi API call completed');
-            return data;
+            return {
+                id: data.id,
+                choices: [
+                    {
+                        index: 0,
+                        message: { role: 'assistant', content: text },
+                        finish_reason: data.stop_reason ?? 'stop',
+                    },
+                ],
+                usage: {
+                    prompt_tokens: inputTokens,
+                    completion_tokens: outputTokens,
+                    total_tokens: inputTokens + outputTokens,
+                    cached_tokens: cachedTokens,
+                },
+            };
         }
         finally {
             clearTimeout(timer);
         }
     }
+}
+function splitSystemMessages(messages) {
+    const systemParts = [];
+    const conversation = [];
+    for (const m of messages) {
+        if (m.role === 'system') {
+            systemParts.push(m.content);
+        }
+        else {
+            conversation.push(m);
+        }
+    }
+    return { system: systemParts.join('\n\n'), conversation };
 }
 
 // EXTERNAL MODULE: ./node_modules/yaml/dist/index.js
