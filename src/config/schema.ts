@@ -23,8 +23,8 @@ export const reviewConfigSchema = z.object({
           performance: z.boolean().default(true),
           style: z.boolean().default(true),
           bestPractices: z.boolean().default(true),
-          documentation: z.boolean().default(false),
-          testing: z.boolean().default(false),
+          documentation: z.boolean().default(true),
+          testing: z.boolean().default(true),
         })
         .default({}),
 
@@ -32,9 +32,9 @@ export const reviewConfigSchema = z.object({
         .enum(['critical', 'warning', 'suggestion', 'nitpick'])
         .default('suggestion'),
 
-      maxAnnotations: z.number().min(1).max(100).default(30),
+      maxAnnotations: z.number().min(1).max(100).default(50),
 
-      failOn: z.enum(['critical', 'warning', 'never']).default('critical'),
+      failOn: z.enum(['critical', 'warning', 'never']).default('warning'),
     })
     .default({}),
 
