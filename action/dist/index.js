@@ -53303,6 +53303,14 @@ const MERGE_TOKEN = 'claude:suggested merge';
 function hasBlockingIssues(r) {
     return r.stats.critical + r.stats.warning > 0;
 }
+/** A review where Kimi's response could not be parsed as JSON.
+ *  In that case parseKimiResponse returns a stub with all-zero stats —
+ *  which would otherwise look identical to a genuinely clean review and
+ *  trigger a false-positive merge handoff to Claude. */
+function isParseFailure(r) {
+    return /failed to parse kimi response/i.test(r.summary)
+        || r.summary === 'Review completed (partial parse)';
+}
 async function run() {
     try {
         const kimiApiKey = core.getInput('kimi_api_key', { required: true });
@@ -53376,8 +53384,8 @@ async function run() {
         let finalResult = first.result;
         let autofixOutcome = 'skipped';
         let finalHeadSha = headSha;
-        // Phase 2: autofix if review has critical/warning
-        if (autofixEnabled && first.prContext && hasBlockingIssues(first.result)) {
+        // Phase 2: autofix if review has critical/warning AND it's not a parse-failure.
+        if (autofixEnabled && first.prContext && hasBlockingIssues(first.result) && !isParseFailure(first.result)) {
             core.info(`Autofix: running (cap ${maxAutofixIterations})...`);
             try {
                 const af = await maybeAutofix({
@@ -53419,9 +53427,13 @@ async function run() {
                 core.warning(`Autofix threw: ${e instanceof Error ? e.message : String(e)}`);
             }
         }
-        // Phase 4: if the final review is clean, signal Claude to merge.
+        else if (isParseFailure(first.result)) {
+            autofixOutcome = 'skipped-parse-failure';
+            core.warning('Kimi review was a parse-failure stub; autofix and merge-handoff skipped.');
+        }
+        // Phase 4: if the final review is clean AND parsed successfully, signal Claude to merge.
         // Idempotency: skip if an existing comment with the merge token already exists.
-        if (autofixEnabled && !hasBlockingIssues(finalResult)) {
+        if (autofixEnabled && !hasBlockingIssues(finalResult) && !isParseFailure(finalResult)) {
             try {
                 let alreadySuggested = false;
                 try {
