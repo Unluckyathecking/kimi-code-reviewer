@@ -22,6 +22,7 @@ async function run(): Promise<void> {
     const failOn = (core.getInput('fail_on') || 'warning') as 'critical' | 'warning' | 'never';
     const autofixEnabled = (core.getInput('autofix') || 'true').toLowerCase() !== 'false';
     const maxAutofixIterations = parseInt(core.getInput('max_autofix_iterations') || '2', 10);
+    const skipIfReviewed = (core.getInput('skip_if_reviewed') || 'true').toLowerCase() !== 'false';
 
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
@@ -40,6 +41,33 @@ async function run(): Promise<void> {
     core.info(`Reviewing PR #${pullNumber} (${headSha.slice(0, 7)}) on ${headRef}`);
 
     const restOctokit = octokit.rest;
+
+    // --- Idempotency check: skip if this exact head SHA was already reviewed by us ---
+    if (skipIfReviewed) {
+      try {
+        const { data: existingReviews } = await restOctokit.pulls.listReviews({
+          owner,
+          repo,
+          pull_number: pullNumber,
+          per_page: 100,
+        });
+        const alreadyReviewed = existingReviews.some(
+          (r) =>
+            (r.user?.login === 'github-actions[bot]' || r.user?.type === 'Bot') &&
+            r.commit_id === headSha &&
+            (r.body || '').includes('Kimi Code Review'),
+        );
+        if (alreadyReviewed) {
+          core.info(`Kimi already reviewed ${headSha.slice(0, 7)}; skipping duplicate run.`);
+          core.setOutput('autofix_outcome', 'skipped-already-reviewed');
+          return;
+        }
+      } catch (e) {
+        core.warning(
+          `Idempotency check failed (continuing with review): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
 
     const config = await loadConfig(restOctokit as any, owner, repo);
     config.review.failOn = failOn;
@@ -126,20 +154,40 @@ async function run(): Promise<void> {
     }
 
     // Phase 4: if the final review is clean, signal Claude to merge.
+    // Idempotency: skip if an existing comment with the merge token already exists.
     if (autofixEnabled && !hasBlockingIssues(finalResult)) {
       try {
-        await restOctokit.issues.createComment({
-          owner,
-          repo,
-          issue_number: pullNumber,
-          body:
-            `Kimi has reviewed this PR — no remaining critical or warning issues.` +
-            (autofixOutcome.startsWith('applied') ? ` Autofix applied at ${finalHeadSha.slice(0, 8)}.` : '') +
-            `\n\n${MERGE_TOKEN}`,
-        });
-        core.info(`Posted ${MERGE_TOKEN}`);
-        if (autofixOutcome === 'skipped') autofixOutcome = 'merge-suggested';
-        else autofixOutcome += '; merge-suggested';
+        let alreadySuggested = false;
+        try {
+          const { data: existingComments } = await restOctokit.issues.listComments({
+            owner,
+            repo,
+            issue_number: pullNumber,
+            per_page: 100,
+          });
+          alreadySuggested = existingComments.some(
+            (c) => (c.body || '').includes(MERGE_TOKEN),
+          );
+        } catch {
+          /* fall through and try to post anyway */
+        }
+
+        if (alreadySuggested) {
+          core.info(`Merge already suggested previously; not re-posting.`);
+        } else {
+          await restOctokit.issues.createComment({
+            owner,
+            repo,
+            issue_number: pullNumber,
+            body:
+              `Kimi has reviewed this PR — no remaining critical or warning issues.` +
+              (autofixOutcome.startsWith('applied') ? ` Autofix applied at ${finalHeadSha.slice(0, 8)}.` : '') +
+              `\n\n${MERGE_TOKEN}`,
+          });
+          core.info(`Posted ${MERGE_TOKEN}`);
+          if (autofixOutcome === 'skipped') autofixOutcome = 'merge-suggested';
+          else autofixOutcome += '; merge-suggested';
+        }
       } catch (e) {
         core.warning(`Failed to post merge-suggest: ${e instanceof Error ? e.message : String(e)}`);
       }
