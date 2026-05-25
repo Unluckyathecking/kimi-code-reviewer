@@ -50435,7 +50435,7 @@ async function createPRReview(octokit, params) {
             ? result.stats.critical > 0 || result.stats.warning > 0
             : false;
     const event = shouldRequestChanges ? 'REQUEST_CHANGES' : 'COMMENT';
-    const body = buildReviewBody(result);
+    const body = buildReviewBody(result, shouldRequestChanges);
     // Create the review with inline comments
     const comments = result.annotations
         .filter((a) => a.severity !== 'nitpick') // nitpicks only go to Check annotations
@@ -50470,7 +50470,7 @@ async function createPRReview(octokit, params) {
         });
     }
 }
-function buildReviewBody(result) {
+function buildReviewBody(result, shouldRequestChanges) {
     const cost = calculateCost(result.tokensUsed);
     const lines = [];
     lines.push('## 🤖 Kimi Code Review\n');
@@ -50484,6 +50484,10 @@ function buildReviewBody(result) {
         if (count > 0) {
             lines.push(`| ${SEVERITY_EMOJI[severity]} ${severity} | ${count} |`);
         }
+    }
+    if (shouldRequestChanges) {
+        lines.push('');
+        lines.push('@jules — please address the feedback above. Push fixes to the same branch and Kimi will re-review automatically.');
     }
     lines.push('');
     lines.push('<details>');

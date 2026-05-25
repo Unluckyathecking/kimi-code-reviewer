@@ -32,7 +32,7 @@ export async function createPRReview(
 
   const event = shouldRequestChanges ? 'REQUEST_CHANGES' : 'COMMENT';
 
-  const body = buildReviewBody(result);
+  const body = buildReviewBody(result, shouldRequestChanges);
 
   // Create the review with inline comments
   const comments = result.annotations
@@ -73,7 +73,7 @@ export async function createPRReview(
   }
 }
 
-function buildReviewBody(result: ReviewResult): string {
+function buildReviewBody(result: ReviewResult, shouldRequestChanges: boolean): string {
   const cost = calculateCost(result.tokensUsed);
   const lines: string[] = [];
 
@@ -88,6 +88,11 @@ function buildReviewBody(result: ReviewResult): string {
     if (count > 0) {
       lines.push(`| ${SEVERITY_EMOJI[severity as Severity]} ${severity} | ${count} |`);
     }
+  }
+
+  if (shouldRequestChanges) {
+    lines.push('');
+    lines.push('@jules — please address the feedback above. Push fixes to the same branch and Kimi will re-review automatically.');
   }
 
   lines.push('');
