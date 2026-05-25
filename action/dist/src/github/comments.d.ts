@@ -7,5 +7,7 @@ export declare function createPRReview(octokit: Octokit, params: {
     commitSha: string;
     result: ReviewResult;
     failOn: 'critical' | 'warning' | 'never';
+    headBranch?: string;
+    authorLogin?: string;
 }): Promise<void>;
 //# sourceMappingURL=comments.d.ts.map

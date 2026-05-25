@@ -19,6 +19,8 @@ interface ReviewParams {
   repo: string;
   pullNumber: number;
   headSha: string;
+  headBranch?: string;
+  authorLogin?: string;
 }
 
 export interface ReviewExecution {
@@ -34,7 +36,7 @@ export class ReviewOrchestrator {
   ) {}
 
   async reviewPullRequest(params: ReviewParams): Promise<ReviewExecution> {
-    const { owner, repo, pullNumber, headSha } = params;
+    const { owner, repo, pullNumber, headSha, headBranch, authorLogin } = params;
 
     // Step 1: Create Check Run
     const checkRunId = await createCheckRun(this.octokit, {
@@ -149,6 +151,8 @@ export class ReviewOrchestrator {
         commitSha: headSha,
         result,
         failOn: this.config.review.failOn,
+        headBranch,
+        authorLogin,
       });
 
       logger.info(

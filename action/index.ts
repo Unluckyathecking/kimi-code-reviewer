@@ -46,6 +46,7 @@ async function run(): Promise<void> {
     const pullNumber = context.payload.pull_request.number;
     const headSha = context.payload.pull_request.head.sha;
     const headRef = context.payload.pull_request.head.ref;
+    const authorLogin = context.payload.pull_request.user?.login || undefined;
 
     core.info(`Reviewing PR #${pullNumber} (${headSha.slice(0, 7)}) on ${headRef}`);
 
@@ -85,7 +86,7 @@ async function run(): Promise<void> {
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);
 
     // Phase 1: initial review
-    const first = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha });
+    const first = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha, headBranch: headRef, authorLogin });
 
     core.setOutput('review_summary', first.result.summary);
     core.setOutput('annotations_count', first.result.annotations.length.toString());
@@ -137,12 +138,7 @@ async function run(): Promise<void> {
           // Phase 3: re-review the autofix commit (GITHUB_TOKEN pushes don't trigger workflows,
           // so we do the second review inline)
           try {
-            const second = await orchestrator.reviewPullRequest({
-              owner,
-              repo,
-              pullNumber,
-              headSha: af.commitSha,
-            });
+            const second = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha: af.commitSha, headBranch: headRef, authorLogin });
             finalResult = second.result;
             core.info(
               `Re-review: score=${second.result.score}, c/w/s=${second.result.stats.critical}/${second.result.stats.warning}/${second.result.stats.suggestion}`,

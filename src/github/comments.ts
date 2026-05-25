@@ -10,6 +10,18 @@ const SEVERITY_EMOJI: Record<Severity, string> = {
   nitpick: '⚪',
 };
 
+/** Heuristic: was this PR opened by Jules? Used to decide whether to @-mention
+ *  Jules in the review body (so we don't ping Jules on user-authored PRs). */
+function isJulesPR(headBranch: string | undefined, authorLogin: string | undefined): boolean {
+  const b = (headBranch || '').toLowerCase();
+  if (b.startsWith('jules/')) return true;
+  // Jules sometimes ships under a generic slug + an embedded numeric session id at the end.
+  if (/-\d{15,}$/.test(b) && /palette|sentinel|bolt|maint|jules/.test(b)) return true;
+  const a = (authorLogin || '').toLowerCase();
+  if (a === 'google-labs-jules[bot]') return true;
+  return false;
+}
+
 export async function createPRReview(
   octokit: Octokit,
   params: {
@@ -19,9 +31,11 @@ export async function createPRReview(
     commitSha: string;
     result: ReviewResult;
     failOn: 'critical' | 'warning' | 'never';
+    headBranch?: string;
+    authorLogin?: string;
   },
 ): Promise<void> {
-  const { owner, repo, pullNumber, commitSha, result, failOn } = params;
+  const { owner, repo, pullNumber, commitSha, result, failOn, headBranch, authorLogin } = params;
 
   const shouldRequestChanges =
     failOn === 'critical'
@@ -31,8 +45,8 @@ export async function createPRReview(
         : false;
 
   const event = shouldRequestChanges ? 'REQUEST_CHANGES' : 'COMMENT';
-
-  const body = buildReviewBody(result, shouldRequestChanges);
+  const jules = isJulesPR(headBranch, authorLogin);
+  const body = buildReviewBody(result, shouldRequestChanges, jules);
 
   // Create the review with inline comments
   const comments = result.annotations
@@ -56,7 +70,7 @@ export async function createPRReview(
     });
 
     logger.info(
-      { pullNumber, event, commentCount: comments.length },
+      { pullNumber, event, commentCount: comments.length, jules },
       'PR review created',
     );
   } catch (err) {
@@ -73,7 +87,11 @@ export async function createPRReview(
   }
 }
 
-function buildReviewBody(result: ReviewResult, shouldRequestChanges: boolean): string {
+function buildReviewBody(
+  result: ReviewResult,
+  shouldRequestChanges: boolean,
+  isJules: boolean,
+): string {
   const cost = calculateCost(result.tokensUsed);
   const lines: string[] = [];
 
@@ -90,7 +108,7 @@ function buildReviewBody(result: ReviewResult, shouldRequestChanges: boolean): s
     }
   }
 
-  if (shouldRequestChanges) {
+  if (shouldRequestChanges && isJules) {
     lines.push('');
     lines.push('@jules — please address the feedback above. Push fixes to the same branch and Kimi will re-review automatically.');
   }

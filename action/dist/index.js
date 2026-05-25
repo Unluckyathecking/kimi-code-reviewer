@@ -50427,15 +50427,30 @@ const SEVERITY_EMOJI = {
     suggestion: '🔵',
     nitpick: '⚪',
 };
+/** Heuristic: was this PR opened by Jules? Used to decide whether to @-mention
+ *  Jules in the review body (so we don't ping Jules on user-authored PRs). */
+function isJulesPR(headBranch, authorLogin) {
+    const b = (headBranch || '').toLowerCase();
+    if (b.startsWith('jules/'))
+        return true;
+    // Jules sometimes ships under a generic slug + an embedded numeric session id at the end.
+    if (/-\d{15,}$/.test(b) && /palette|sentinel|bolt|maint|jules/.test(b))
+        return true;
+    const a = (authorLogin || '').toLowerCase();
+    if (a === 'google-labs-jules[bot]')
+        return true;
+    return false;
+}
 async function createPRReview(octokit, params) {
-    const { owner, repo, pullNumber, commitSha, result, failOn } = params;
+    const { owner, repo, pullNumber, commitSha, result, failOn, headBranch, authorLogin } = params;
     const shouldRequestChanges = failOn === 'critical'
         ? result.stats.critical > 0
         : failOn === 'warning'
             ? result.stats.critical > 0 || result.stats.warning > 0
             : false;
     const event = shouldRequestChanges ? 'REQUEST_CHANGES' : 'COMMENT';
-    const body = buildReviewBody(result, shouldRequestChanges);
+    const jules = isJulesPR(headBranch, authorLogin);
+    const body = buildReviewBody(result, shouldRequestChanges, jules);
     // Create the review with inline comments
     const comments = result.annotations
         .filter((a) => a.severity !== 'nitpick') // nitpicks only go to Check annotations
@@ -50455,7 +50470,7 @@ async function createPRReview(octokit, params) {
             body,
             comments,
         });
-        logger.info({ pullNumber, event, commentCount: comments.length }, 'PR review created');
+        logger.info({ pullNumber, event, commentCount: comments.length, jules }, 'PR review created');
     }
     catch (err) {
         // If inline comments fail (e.g., line not in diff), fall back to body-only review
@@ -50470,7 +50485,7 @@ async function createPRReview(octokit, params) {
         });
     }
 }
-function buildReviewBody(result, shouldRequestChanges) {
+function buildReviewBody(result, shouldRequestChanges, isJules) {
     const cost = calculateCost(result.tokensUsed);
     const lines = [];
     lines.push('## 🤖 Kimi Code Review\n');
@@ -50485,7 +50500,7 @@ function buildReviewBody(result, shouldRequestChanges) {
             lines.push(`| ${SEVERITY_EMOJI[severity]} ${severity} | ${count} |`);
         }
     }
-    if (shouldRequestChanges) {
+    if (shouldRequestChanges && isJules) {
         lines.push('');
         lines.push('@jules — please address the feedback above. Push fixes to the same branch and Kimi will re-review automatically.');
     }
@@ -52733,7 +52748,7 @@ class ReviewOrchestrator {
         this.config = config;
     }
     async reviewPullRequest(params) {
-        const { owner, repo, pullNumber, headSha } = params;
+        const { owner, repo, pullNumber, headSha, headBranch, authorLogin } = params;
         // Step 1: Create Check Run
         const checkRunId = await createCheckRun(this.octokit, {
             owner,
@@ -52816,6 +52831,8 @@ class ReviewOrchestrator {
                 commitSha: headSha,
                 result,
                 failOn: this.config.review.failOn,
+                headBranch,
+                authorLogin,
             });
             logger.info({
                 pullNumber,
@@ -53332,6 +53349,7 @@ async function run() {
         const pullNumber = context.payload.pull_request.number;
         const headSha = context.payload.pull_request.head.sha;
         const headRef = context.payload.pull_request.head.ref;
+        const authorLogin = context.payload.pull_request.user?.login || undefined;
         core.info(`Reviewing PR #${pullNumber} (${headSha.slice(0, 7)}) on ${headRef}`);
         const restOctokit = octokit.rest;
         // --- Idempotency check: skip if this exact head SHA was already reviewed by us ---
@@ -53361,7 +53379,7 @@ async function run() {
         const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
         // Phase 1: initial review
-        const first = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha });
+        const first = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha, headBranch: headRef, authorLogin });
         core.setOutput('review_summary', first.result.summary);
         core.setOutput('annotations_count', first.result.annotations.length.toString());
         core.setOutput('critical_count', first.result.stats.critical.toString());
@@ -53404,12 +53422,7 @@ async function run() {
                     // Phase 3: re-review the autofix commit (GITHUB_TOKEN pushes don't trigger workflows,
                     // so we do the second review inline)
                     try {
-                        const second = await orchestrator.reviewPullRequest({
-                            owner,
-                            repo,
-                            pullNumber,
-                            headSha: af.commitSha,
-                        });
+                        const second = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha: af.commitSha, headBranch: headRef, authorLogin });
                         finalResult = second.result;
                         core.info(`Re-review: score=${second.result.score}, c/w/s=${second.result.stats.critical}/${second.result.stats.warning}/${second.result.stats.suggestion}`);
                     }

@@ -7,6 +7,8 @@ interface ReviewParams {
     repo: string;
     pullNumber: number;
     headSha: string;
+    headBranch?: string;
+    authorLogin?: string;
 }
 export interface ReviewExecution {
     result: ReviewResult;
