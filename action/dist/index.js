@@ -52763,7 +52763,7 @@ class ReviewOrchestrator {
                     summary: result.summary,
                     annotations: [],
                 });
-                return result;
+                return { result, prContext };
             }
             // Step 4: Pack context (256K optimization)
             const packed = packContext(prContext, this.config);
@@ -52823,7 +52823,7 @@ class ReviewOrchestrator {
                 annotations: result.annotations.length,
                 conclusion,
             }, 'Review completed');
-            return result;
+            return { result, prContext };
         }
         catch (err) {
             logger.error({ err, pullNumber }, 'Review failed');
@@ -53102,6 +53102,195 @@ function parseYaml(content) {
     return parsed;
 }
 
+// EXTERNAL MODULE: external "child_process"
+var external_child_process_ = __nccwpck_require__(5317);
+// EXTERNAL MODULE: external "fs"
+var external_fs_ = __nccwpck_require__(9896);
+// EXTERNAL MODULE: external "os"
+var external_os_ = __nccwpck_require__(857);
+// EXTERNAL MODULE: external "path"
+var external_path_ = __nccwpck_require__(6928);
+;// CONCATENATED MODULE: ./src/autofix/orchestrator.ts
+
+
+
+
+
+const COMMIT_MARKER = '[kimi-autofix]';
+function git(args, cwd) {
+    try {
+        return (0,external_child_process_.execFileSync)('git', args, {
+            cwd,
+            encoding: 'utf-8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim();
+    }
+    catch (err) {
+        const e = err;
+        const stderr = e.stderr ? (Buffer.isBuffer(e.stderr) ? e.stderr.toString() : e.stderr) : '';
+        throw new Error(`git ${args.join(' ')} failed: ${stderr || e.message}`);
+    }
+}
+/** Count existing autofix commits on the current branch by scanning HEAD's history. */
+function countAutofixIterations() {
+    try {
+        const log = git(['log', '--format=%s', `--grep=${COMMIT_MARKER}`, '-n', '100']);
+        if (!log)
+            return 0;
+        return log.split('\n').filter((s) => s.includes(COMMIT_MARKER)).length;
+    }
+    catch {
+        return 0;
+    }
+}
+function buildAutofixMessages(ctx, result, config) {
+    // Take only critical + warning annotations — autofix should not chase nitpicks.
+    const actionable = result.annotations.filter((a) => a.severity === 'critical' || a.severity === 'warning');
+    const annotationsText = actionable
+        .map((a, i) => `${i + 1}. [${a.severity}] ${a.path}:${a.startLine}-${a.endLine} — ${a.title}\n   ${a.body}${a.suggestedFix ? `\n   Suggested fix snippet:\n${a.suggestedFix}` : ''}`)
+        .join('\n\n');
+    const fileBlocks = [];
+    for (const [path, content] of ctx.fileContents) {
+        fileBlocks.push(`### ${path}\n\`\`\`\n${content}\n\`\`\``);
+    }
+    const system = `You are a senior staff engineer applying YOUR OWN code review feedback as a patch.
+
+You previously reviewed this pull request and flagged ${actionable.length} actionable issues (critical/warning).
+
+Your task: produce a unified git diff that fixes EVERY listed issue against the current PR head.
+
+OUTPUT FORMAT (strict):
+- Output ONLY the unified diff, starting with the first \`diff --git\` line.
+- No prose, no markdown code fences, no explanations before or after.
+- Each hunk header MUST be a real \`@@ -X,Y +A,B @@\` line that \`git apply\` can consume.
+- File paths use the form \`a/<path>\` and \`b/<path>\` exactly as they appear in the file list below.
+
+RULES:
+- Modify only files listed below. Do not create or delete files. Do not touch lockfiles, Dockerfiles, or CI config.
+- Address every CRITICAL and WARNING. Ignore suggestions and nitpicks.
+- Keep the diff minimal — only the lines needed to fix the flagged issues.
+- Do not add or remove dependencies. Do not change exported function/type signatures unless the flagged issue forces it.
+- If any single issue cannot be fixed safely with a minimal patch (e.g. requires architectural changes), include comments in the diff for the ones you can do and skip the impossible one rather than producing a bad diff.
+- If you cannot fix ANY of the issues safely, output the literal string \`NO_PATCH: <one-line reason>\` and nothing else.
+
+The patch will be applied with \`git apply\` against the current working tree (which is the PR head), then committed by github-actions[bot] and pushed back to the PR branch, triggering another Kimi review of the result.`;
+    const user = `## Files at the current PR head\n\n${fileBlocks.join('\n\n')}\n\n## Your review of this PR\n\n**Summary:** ${result.summary}\n\n**Score:** ${result.score}/100\n\n## Actionable annotations to fix\n\n${annotationsText}\n\n## Now produce the unified diff (or NO_PATCH: <reason>):`;
+    return [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+    ];
+}
+function extractDiff(raw) {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('NO_PATCH:'))
+        return null;
+    // 1. fenced block?
+    const fenced = trimmed.match(/```(?:diff|patch)?\s*\n([\s\S]*?)\n```/);
+    const candidate = fenced ? fenced[1] : trimmed;
+    // 2. find the start of the diff
+    const startIdx = candidate.indexOf('diff --git');
+    if (startIdx < 0)
+        return null;
+    let diff = candidate.slice(startIdx);
+    // 3. trim anything after the diff (e.g. a blank line + prose)
+    // git diffs have no trailing prose by convention; cut at the first long blank+prose pattern
+    diff = diff.replace(/\n+(?=\S)\n[^\-+@d ].*$/s, '\n');
+    if (!diff.endsWith('\n'))
+        diff += '\n';
+    return diff;
+}
+async function maybeAutofix(params) {
+    const { kimi, ctx, result, config, headBranch, maxIterations } = params;
+    // Only act on critical/warning. SUGGESTION/NITPICK reviews don't trigger autofix.
+    const actionable = result.stats.critical + result.stats.warning;
+    if (actionable === 0) {
+        return { attempted: false, applied: false, pushed: false, reason: 'no critical/warning to fix' };
+    }
+    const priorIters = countAutofixIterations();
+    if (priorIters >= maxIterations) {
+        return {
+            attempted: false,
+            applied: false,
+            pushed: false,
+            reason: `iteration cap reached (${priorIters}/${maxIterations}); leaving for @jules`,
+        };
+    }
+    logger.info({ priorIters, maxIterations, actionable }, 'Kimi autofix starting');
+    // Ask Kimi for a patch.
+    const messages = buildAutofixMessages(ctx, result, config);
+    const response = await kimi.chatCompletion({ messages });
+    const raw = response.choices[0]?.message?.content ?? '';
+    const diff = extractDiff(raw);
+    if (!diff) {
+        logger.warn({ rawPreview: raw.slice(0, 300) }, 'Autofix: no usable diff in Kimi response');
+        return {
+            attempted: true,
+            applied: false,
+            pushed: false,
+            reason: raw.trim().startsWith('NO_PATCH:') ? raw.trim() : 'no diff extractable',
+        };
+    }
+    const patchPath = (0,external_path_.join)((0,external_os_.tmpdir)(), `kimi-autofix-${Date.now()}.patch`);
+    (0,external_fs_.writeFileSync)(patchPath, diff, 'utf-8');
+    try {
+        // Configure git identity for the bot.
+        git(['config', 'user.email', 'github-actions[bot]@users.noreply.github.com']);
+        git(['config', 'user.name', 'github-actions[bot]']);
+        // Apply the patch.
+        try {
+            git(['apply', '--check', patchPath]);
+        }
+        catch (e) {
+            logger.warn({ err: e.message, diffPreview: diff.slice(0, 400) }, 'Autofix: git apply --check failed');
+            return {
+                attempted: true,
+                applied: false,
+                pushed: false,
+                reason: `git apply --check failed: ${e.message.slice(0, 200)}`,
+            };
+        }
+        git(['apply', patchPath]);
+        // Stage + commit.
+        git(['add', '-A']);
+        const status = git(['status', '--porcelain']);
+        if (!status) {
+            return { attempted: true, applied: false, pushed: false, reason: 'patch produced no net changes' };
+        }
+        const iter = priorIters + 1;
+        const message = `fix: address Kimi review feedback ${COMMIT_MARKER} iter=${iter}/${maxIterations}`;
+        git(['commit', '-m', message]);
+        const sha = git(['rev-parse', 'HEAD']);
+        // Push back to the PR branch.
+        try {
+            git(['push', 'origin', `HEAD:${headBranch}`]);
+            logger.info({ sha, headBranch }, 'Autofix pushed');
+            return { attempted: true, applied: true, pushed: true, reason: 'autofix committed and pushed', commitSha: sha };
+        }
+        catch (e) {
+            logger.error({ err: e.message }, 'Autofix: push failed');
+            return {
+                attempted: true,
+                applied: true,
+                pushed: false,
+                reason: `commit succeeded but push failed: ${e.message.slice(0, 200)}`,
+                commitSha: sha,
+            };
+        }
+    }
+    finally {
+        try {
+            (0,external_fs_.unlinkSync)(patchPath);
+        }
+        catch {
+            /* ignore */
+        }
+    }
+}
+/** Returns true if any commit on the current branch carries the autofix marker. */
+function branchHasAutofixCommits() {
+    return countAutofixIterations() > 0;
+}
+
 ;// CONCATENATED MODULE: ./action/index.ts
 
 
@@ -53109,17 +53298,22 @@ function parseYaml(content) {
 
 
 
+
+const MERGE_TOKEN = 'claude:suggested merge';
+function hasBlockingIssues(r) {
+    return r.stats.critical + r.stats.warning > 0;
+}
 async function run() {
     try {
-        // Get inputs
         const kimiApiKey = core.getInput('kimi_api_key', { required: true });
         const githubToken = core.getInput('github_token');
         const model = core.getInput('model') || 'kimi-for-coding';
         const baseUrl = core.getInput('base_url') || undefined;
         const failOn = (core.getInput('fail_on') || 'warning');
+        const autofixEnabled = (core.getInput('autofix') || 'true').toLowerCase() !== 'false';
+        const maxAutofixIterations = parseInt(core.getInput('max_autofix_iterations') || '2', 10);
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
-        // Only run on pull requests
         if (!context.payload.pull_request) {
             core.info('Not a pull request event, skipping.');
             return;
@@ -53128,52 +53322,108 @@ async function run() {
         const repo = context.repo.repo;
         const pullNumber = context.payload.pull_request.number;
         const headSha = context.payload.pull_request.head.sha;
-        core.info(`Reviewing PR #${pullNumber} (${headSha.slice(0, 7)})`);
-        // @actions/github getOctokit puts REST methods under .rest,
-        // but our code expects @octokit/rest shape (octokit.checks, octokit.pulls, etc.)
+        const headRef = context.payload.pull_request.head.ref;
+        core.info(`Reviewing PR #${pullNumber} (${headSha.slice(0, 7)}) on ${headRef}`);
         const restOctokit = octokit.rest;
-        // Load config from repo
         const config = await loadConfig(restOctokit, owner, repo);
-        // Override failOn from action input
         config.review.failOn = failOn;
-        // Create Kimi client
         const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
-        // Run review
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
-        const result = await orchestrator.reviewPullRequest({
-            owner,
-            repo,
-            pullNumber,
-            headSha,
-        });
-        // Set outputs
-        core.setOutput('review_summary', result.summary);
-        core.setOutput('annotations_count', result.annotations.length.toString());
-        core.setOutput('critical_count', result.stats.critical.toString());
-        core.setOutput('tokens_used', (result.tokensUsed.input + result.tokensUsed.output).toString());
-        core.setOutput('cost_estimate', calculateCost(result.tokensUsed).toString());
-        // Summary in job output
+        // Phase 1: initial review
+        const first = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha });
+        core.setOutput('review_summary', first.result.summary);
+        core.setOutput('annotations_count', first.result.annotations.length.toString());
+        core.setOutput('critical_count', first.result.stats.critical.toString());
+        core.setOutput('tokens_used', (first.result.tokensUsed.input + first.result.tokensUsed.output).toString());
+        core.setOutput('cost_estimate', calculateCost(first.result.tokensUsed).toString());
         core.summary
             .addHeading('Kimi Code Review', 2)
-            .addRaw(`**Score:** ${result.score}/100\n\n`)
-            .addRaw(result.summary)
+            .addRaw(`**Score:** ${first.result.score}/100\n\n`)
+            .addRaw(first.result.summary)
             .addTable([
             [
                 { data: 'Severity', header: true },
                 { data: 'Count', header: true },
             ],
-            ['Critical', result.stats.critical.toString()],
-            ['Warning', result.stats.warning.toString()],
-            ['Suggestion', result.stats.suggestion.toString()],
+            ['Critical', first.result.stats.critical.toString()],
+            ['Warning', first.result.stats.warning.toString()],
+            ['Suggestion', first.result.stats.suggestion.toString()],
         ]);
         await core.summary.write();
-        // Fail the action if needed
-        if (failOn === 'critical' && result.stats.critical > 0) {
-            core.setFailed(`Found ${result.stats.critical} critical issue(s)`);
+        let finalResult = first.result;
+        let autofixOutcome = 'skipped';
+        let finalHeadSha = headSha;
+        // Phase 2: autofix if review has critical/warning
+        if (autofixEnabled && first.prContext && hasBlockingIssues(first.result)) {
+            core.info(`Autofix: running (cap ${maxAutofixIterations})...`);
+            try {
+                const af = await maybeAutofix({
+                    kimi,
+                    ctx: first.prContext,
+                    result: first.result,
+                    config,
+                    headBranch: headRef,
+                    maxIterations: maxAutofixIterations,
+                    octokit: restOctokit,
+                });
+                if (af.pushed && af.commitSha) {
+                    autofixOutcome = `applied (commit ${af.commitSha.slice(0, 8)})`;
+                    core.info(`Autofix pushed ${af.commitSha} — re-reviewing the new head.`);
+                    finalHeadSha = af.commitSha;
+                    // Phase 3: re-review the autofix commit (GITHUB_TOKEN pushes don't trigger workflows,
+                    // so we do the second review inline)
+                    try {
+                        const second = await orchestrator.reviewPullRequest({
+                            owner,
+                            repo,
+                            pullNumber,
+                            headSha: af.commitSha,
+                        });
+                        finalResult = second.result;
+                        core.info(`Re-review: score=${second.result.score}, c/w/s=${second.result.stats.critical}/${second.result.stats.warning}/${second.result.stats.suggestion}`);
+                    }
+                    catch (e) {
+                        core.warning(`Re-review after autofix failed: ${e instanceof Error ? e.message : String(e)}`);
+                    }
+                }
+                else {
+                    autofixOutcome = `noop (${af.reason})`;
+                    core.info(`Autofix: ${autofixOutcome}`);
+                }
+            }
+            catch (e) {
+                autofixOutcome = `errored: ${e instanceof Error ? e.message : 'unknown'}`;
+                core.warning(`Autofix threw: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+        // Phase 4: if the final review is clean, signal Claude to merge.
+        if (autofixEnabled && !hasBlockingIssues(finalResult)) {
+            try {
+                await restOctokit.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pullNumber,
+                    body: `Kimi has reviewed this PR — no remaining critical or warning issues.` +
+                        (autofixOutcome.startsWith('applied') ? ` Autofix applied at ${finalHeadSha.slice(0, 8)}.` : '') +
+                        `\n\n${MERGE_TOKEN}`,
+                });
+                core.info(`Posted ${MERGE_TOKEN}`);
+                if (autofixOutcome === 'skipped')
+                    autofixOutcome = 'merge-suggested';
+                else
+                    autofixOutcome += '; merge-suggested';
+            }
+            catch (e) {
+                core.warning(`Failed to post merge-suggest: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+        core.setOutput('autofix_outcome', autofixOutcome);
+        if (failOn === 'critical' && finalResult.stats.critical > 0) {
+            core.setFailed(`Found ${finalResult.stats.critical} critical issue(s)`);
         }
         else if (failOn === 'warning' &&
-            (result.stats.critical > 0 || result.stats.warning > 0)) {
-            core.setFailed(`Found ${result.stats.critical} critical and ${result.stats.warning} warning issue(s)`);
+            (finalResult.stats.critical > 0 || finalResult.stats.warning > 0)) {
+            core.setFailed(`Found ${finalResult.stats.critical} critical and ${finalResult.stats.warning} warning issue(s)`);
         }
     }
     catch (error) {

@@ -1,23 +1,31 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import { ReviewOrchestrator } from '../src/review/orchestrator.js';
+import type { ReviewResult } from '../src/types/review.js';
 import { KimiClient } from '../src/kimi/client.js';
 import { loadConfig } from '../src/config/loader.js';
 import { calculateCost } from '../src/utils/tokens.js';
+import { maybeAutofix } from '../src/autofix/orchestrator.js';
+
+const MERGE_TOKEN = 'claude:suggested merge';
+
+function hasBlockingIssues(r: ReviewResult): boolean {
+  return r.stats.critical + r.stats.warning > 0;
+}
 
 async function run(): Promise<void> {
   try {
-    // Get inputs
     const kimiApiKey = core.getInput('kimi_api_key', { required: true });
     const githubToken = core.getInput('github_token');
     const model = core.getInput('model') || 'kimi-for-coding';
     const baseUrl = core.getInput('base_url') || undefined;
     const failOn = (core.getInput('fail_on') || 'warning') as 'critical' | 'warning' | 'never';
+    const autofixEnabled = (core.getInput('autofix') || 'true').toLowerCase() !== 'false';
+    const maxAutofixIterations = parseInt(core.getInput('max_autofix_iterations') || '2', 10);
 
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
 
-    // Only run on pull requests
     if (!context.payload.pull_request) {
       core.info('Not a pull request event, skipping.');
       return;
@@ -27,65 +35,126 @@ async function run(): Promise<void> {
     const repo = context.repo.repo;
     const pullNumber = context.payload.pull_request.number;
     const headSha = context.payload.pull_request.head.sha;
+    const headRef = context.payload.pull_request.head.ref;
 
-    core.info(`Reviewing PR #${pullNumber} (${headSha.slice(0, 7)})`);
+    core.info(`Reviewing PR #${pullNumber} (${headSha.slice(0, 7)}) on ${headRef}`);
 
-    // @actions/github getOctokit puts REST methods under .rest,
-    // but our code expects @octokit/rest shape (octokit.checks, octokit.pulls, etc.)
     const restOctokit = octokit.rest;
 
-    // Load config from repo
     const config = await loadConfig(restOctokit as any, owner, repo);
-    // Override failOn from action input
     config.review.failOn = failOn;
 
-    // Create Kimi client
     const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
-
-    // Run review
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);
-    const result = await orchestrator.reviewPullRequest({
-      owner,
-      repo,
-      pullNumber,
-      headSha,
-    });
 
-    // Set outputs
-    core.setOutput('review_summary', result.summary);
-    core.setOutput('annotations_count', result.annotations.length.toString());
-    core.setOutput('critical_count', result.stats.critical.toString());
+    // Phase 1: initial review
+    const first = await orchestrator.reviewPullRequest({ owner, repo, pullNumber, headSha });
+
+    core.setOutput('review_summary', first.result.summary);
+    core.setOutput('annotations_count', first.result.annotations.length.toString());
+    core.setOutput('critical_count', first.result.stats.critical.toString());
     core.setOutput(
       'tokens_used',
-      (result.tokensUsed.input + result.tokensUsed.output).toString(),
+      (first.result.tokensUsed.input + first.result.tokensUsed.output).toString(),
     );
-    core.setOutput('cost_estimate', calculateCost(result.tokensUsed).toString());
+    core.setOutput('cost_estimate', calculateCost(first.result.tokensUsed).toString());
 
-    // Summary in job output
     core.summary
       .addHeading('Kimi Code Review', 2)
-      .addRaw(`**Score:** ${result.score}/100\n\n`)
-      .addRaw(result.summary)
+      .addRaw(`**Score:** ${first.result.score}/100\n\n`)
+      .addRaw(first.result.summary)
       .addTable([
         [
           { data: 'Severity', header: true },
           { data: 'Count', header: true },
         ],
-        ['Critical', result.stats.critical.toString()],
-        ['Warning', result.stats.warning.toString()],
-        ['Suggestion', result.stats.suggestion.toString()],
+        ['Critical', first.result.stats.critical.toString()],
+        ['Warning', first.result.stats.warning.toString()],
+        ['Suggestion', first.result.stats.suggestion.toString()],
       ]);
     await core.summary.write();
 
-    // Fail the action if needed
-    if (failOn === 'critical' && result.stats.critical > 0) {
-      core.setFailed(`Found ${result.stats.critical} critical issue(s)`);
+    let finalResult = first.result;
+    let autofixOutcome = 'skipped';
+    let finalHeadSha = headSha;
+
+    // Phase 2: autofix if review has critical/warning
+    if (autofixEnabled && first.prContext && hasBlockingIssues(first.result)) {
+      core.info(`Autofix: running (cap ${maxAutofixIterations})...`);
+      try {
+        const af = await maybeAutofix({
+          kimi,
+          ctx: first.prContext,
+          result: first.result,
+          config,
+          headBranch: headRef,
+          maxIterations: maxAutofixIterations,
+          octokit: restOctokit as any,
+        });
+
+        if (af.pushed && af.commitSha) {
+          autofixOutcome = `applied (commit ${af.commitSha.slice(0, 8)})`;
+          core.info(`Autofix pushed ${af.commitSha} — re-reviewing the new head.`);
+          finalHeadSha = af.commitSha;
+
+          // Phase 3: re-review the autofix commit (GITHUB_TOKEN pushes don't trigger workflows,
+          // so we do the second review inline)
+          try {
+            const second = await orchestrator.reviewPullRequest({
+              owner,
+              repo,
+              pullNumber,
+              headSha: af.commitSha,
+            });
+            finalResult = second.result;
+            core.info(
+              `Re-review: score=${second.result.score}, c/w/s=${second.result.stats.critical}/${second.result.stats.warning}/${second.result.stats.suggestion}`,
+            );
+          } catch (e) {
+            core.warning(
+              `Re-review after autofix failed: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        } else {
+          autofixOutcome = `noop (${af.reason})`;
+          core.info(`Autofix: ${autofixOutcome}`);
+        }
+      } catch (e) {
+        autofixOutcome = `errored: ${e instanceof Error ? e.message : 'unknown'}`;
+        core.warning(`Autofix threw: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // Phase 4: if the final review is clean, signal Claude to merge.
+    if (autofixEnabled && !hasBlockingIssues(finalResult)) {
+      try {
+        await restOctokit.issues.createComment({
+          owner,
+          repo,
+          issue_number: pullNumber,
+          body:
+            `Kimi has reviewed this PR — no remaining critical or warning issues.` +
+            (autofixOutcome.startsWith('applied') ? ` Autofix applied at ${finalHeadSha.slice(0, 8)}.` : '') +
+            `\n\n${MERGE_TOKEN}`,
+        });
+        core.info(`Posted ${MERGE_TOKEN}`);
+        if (autofixOutcome === 'skipped') autofixOutcome = 'merge-suggested';
+        else autofixOutcome += '; merge-suggested';
+      } catch (e) {
+        core.warning(`Failed to post merge-suggest: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    core.setOutput('autofix_outcome', autofixOutcome);
+
+    if (failOn === 'critical' && finalResult.stats.critical > 0) {
+      core.setFailed(`Found ${finalResult.stats.critical} critical issue(s)`);
     } else if (
       failOn === 'warning' &&
-      (result.stats.critical > 0 || result.stats.warning > 0)
+      (finalResult.stats.critical > 0 || finalResult.stats.warning > 0)
     ) {
       core.setFailed(
-        `Found ${result.stats.critical} critical and ${result.stats.warning} warning issue(s)`,
+        `Found ${finalResult.stats.critical} critical and ${finalResult.stats.warning} warning issue(s)`,
       );
     }
   } catch (error) {

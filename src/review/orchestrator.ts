@@ -1,6 +1,6 @@
 import type { Octokit } from '@octokit/rest';
 import type { ReviewConfig } from '../config/schema.js';
-import type { ReviewResult } from '../types/review.js';
+import type { PullRequestContext, ReviewResult } from '../types/review.js';
 import { KimiClient } from '../kimi/client.js';
 import { packContext } from '../kimi/context-packer.js';
 import { buildReviewMessages } from '../kimi/prompt-builder.js';
@@ -21,6 +21,11 @@ interface ReviewParams {
   headSha: string;
 }
 
+export interface ReviewExecution {
+  result: ReviewResult;
+  prContext: PullRequestContext | null;
+}
+
 export class ReviewOrchestrator {
   constructor(
     private octokit: Octokit,
@@ -28,7 +33,7 @@ export class ReviewOrchestrator {
     private config: ReviewConfig,
   ) {}
 
-  async reviewPullRequest(params: ReviewParams): Promise<ReviewResult> {
+  async reviewPullRequest(params: ReviewParams): Promise<ReviewExecution> {
     const { owner, repo, pullNumber, headSha } = params;
 
     // Step 1: Create Check Run
@@ -71,7 +76,7 @@ export class ReviewOrchestrator {
           annotations: [],
         });
 
-        return result;
+        return { result, prContext };
       }
 
       // Step 4: Pack context (256K optimization)
@@ -156,7 +161,7 @@ export class ReviewOrchestrator {
         'Review completed',
       );
 
-      return result;
+      return { result, prContext };
     } catch (err) {
       logger.error({ err, pullNumber }, 'Review failed');
 

@@ -34,6 +34,14 @@ inputs:
     description: 'Path to config file (relative to repo root)'
     required: false
     default: '.kimi-review.yml'
+  autofix:
+    description: 'When the review flags critical/warning issues, ask Kimi to generate a patch, apply it, and push the commit back to the PR branch (true/false).'
+    required: false
+    default: 'true'
+  max_autofix_iterations:
+    description: 'Maximum number of autofix commits per PR branch before bailing out and leaving it to @jules.'
+    required: false
+    default: '2'
 
 outputs:
   review_summary:
@@ -46,6 +54,8 @@ outputs:
     description: 'Total tokens used'
   cost_estimate:
     description: 'Estimated API cost in USD'
+  autofix_outcome:
+    description: 'One of: skipped, applied, noop, merge-suggested, errored'
 
 runs:
   using: 'node20'
