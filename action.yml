@@ -39,9 +39,9 @@ inputs:
     required: false
     default: 'true'
   max_autofix_iterations:
-    description: 'Maximum number of autofix commits per PR branch before bailing out and leaving it to @jules.'
+    description: 'Maximum number of autofix commits per PR branch before bailing out and leaving it to the next reviewer.'
     required: false
-    default: '2'
+    default: '10'
 
 outputs:
   review_summary:

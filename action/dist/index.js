@@ -53487,7 +53487,7 @@ async function run() {
         const baseUrl = core.getInput('base_url') || undefined;
         const failOn = (core.getInput('fail_on') || 'warning');
         const autofixEnabled = (core.getInput('autofix') || 'true').toLowerCase() !== 'false';
-        const maxAutofixIterations = parseInt(core.getInput('max_autofix_iterations') || '2', 10);
+        const maxAutofixIterations = parseInt(core.getInput('max_autofix_iterations') || '10', 10);
         const skipIfReviewed = (core.getInput('skip_if_reviewed') || 'true').toLowerCase() !== 'false';
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
