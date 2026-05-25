@@ -50322,11 +50322,19 @@ function parseKimiResponse(raw, tokenUsage) {
             rawHead: raw.slice(0, 2000),
             rawTail: raw.length > 2000 ? raw.slice(-1000) : null,
         }, 'Could not extract JSON from Kimi response');
+        // Parse failure must be a HARD failure, not a quiet zero-stats stub.
+        // Earlier behaviour returned `stats.critical=0` which caused the check conclusion
+        // logic to treat a failed parse as non-blocking — that lets PRs slip through
+        // with no real review. A failed parse means "review unavailable", which is
+        // strictly worse than "review found warnings". Surface it as critical=1 so the
+        // check fails, no merge token is emitted, and a human (or retry) must intervene.
         return {
-            summary: 'Failed to parse Kimi response as JSON.',
-            score: 50,
+            summary: 'Failed to parse Kimi response as JSON. Review is unavailable for this commit — ' +
+                'the action could not extract a structured review from the model output. Push a fresh ' +
+                'commit to retry, or inspect the action log for the raw response.',
+            score: 0,
             annotations: [],
-            stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
+            stats: { critical: 1, warning: 0, suggestion: 0, nitpick: 0 },
             tokensUsed: tokenUsage,
         };
     }

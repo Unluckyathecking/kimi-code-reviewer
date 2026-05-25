@@ -140,12 +140,14 @@ That concludes my review.`;
     expect(result.summary).toBe('Mixed results');
   });
 
-  it('returns fallback for completely unparseable text', () => {
+  it('parse-failure is hard-blocking (score 0, critical=1) — review unavailable should NOT slip through', () => {
     const raw = 'I cannot provide a review for this PR.';
     const result = parseKimiResponse(raw, usage);
-    expect(result.score).toBe(50);
+    expect(result.score).toBe(0);
+    expect(result.stats.critical).toBe(1);
     expect(result.annotations).toHaveLength(0);
     expect(result.tokensUsed).toEqual(usage);
+    expect(result.summary).toContain('Review is unavailable');
   });
 
   it('parses JSON inside ```json fence even when content has internal triple-backticks', () => {
