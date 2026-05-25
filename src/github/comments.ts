@@ -10,16 +10,31 @@ const SEVERITY_EMOJI: Record<Severity, string> = {
   nitpick: '⚪',
 };
 
-/** Heuristic: was this PR opened by Jules? Used to decide whether to @-mention
- *  Jules in the review body (so we don't ping Jules on user-authored PRs). */
-function isJulesPR(headBranch: string | undefined, authorLogin: string | undefined): boolean {
-  const b = (headBranch || '').toLowerCase();
-  if (b.startsWith('jules/')) return true;
-  // Jules sometimes ships under a generic slug + an embedded numeric session id at the end.
-  if (/-\d{15,}$/.test(b) && /palette|sentinel|bolt|maint|jules/.test(b)) return true;
-  const a = (authorLogin || '').toLowerCase();
-  if (a === 'google-labs-jules[bot]') return true;
-  return false;
+/** Resolve which AI agent (if any) is responsible for iterating on this PR.
+ *  Returns the mention handle to tag, or null if we shouldn't auto-mention. */
+function resolveAgentHandle(
+  headBranch: string | undefined,
+  authorLogin: string | undefined,
+): { handle: string; name: string } | null {
+  const branch = (headBranch || '').toLowerCase();
+  const author = (authorLogin || '').toLowerCase();
+
+  // Bot author is the strongest signal.
+  if (author === 'google-labs-jules[bot]') return { handle: '@jules', name: 'Jules' };
+  if (author === 'chatgpt-codex-connector[bot]') return { handle: '@codex', name: 'Codex' };
+
+  // Branch prefix conventions used by autonomous agents in this org.
+  if (branch.startsWith('jules/')) return { handle: '@jules', name: 'Jules' };
+  if (branch.startsWith('codex/')) return { handle: '@codex', name: 'Codex' };
+
+  // Jules-engine personas (Bolt/Palette/Sentinel) often slug-prefix without the
+  // jules/ namespace; the trailing 15+ digit session id is the giveaway.
+  if (/(palette|sentinel|bolt)/.test(branch) && /\d{15,}/.test(branch)) {
+    return { handle: '@jules', name: 'Jules' };
+  }
+
+  // Unknown / user-authored PR — don't auto-mention anyone.
+  return null;
 }
 
 export async function createPRReview(
@@ -45,12 +60,12 @@ export async function createPRReview(
         : false;
 
   const event = shouldRequestChanges ? 'REQUEST_CHANGES' : 'COMMENT';
-  const jules = isJulesPR(headBranch, authorLogin);
-  const body = buildReviewBody(result, shouldRequestChanges, jules);
+  const agent = resolveAgentHandle(headBranch, authorLogin);
+  const body = buildReviewBody(result, shouldRequestChanges, agent);
 
-  // Create the review with inline comments
+  // Inline comments on each non-nitpick annotation.
   const comments = result.annotations
-    .filter((a) => a.severity !== 'nitpick') // nitpicks only go to Check annotations
+    .filter((a) => a.severity !== 'nitpick')
     .map((a) => ({
       path: a.path,
       line: a.endLine,
@@ -70,11 +85,10 @@ export async function createPRReview(
     });
 
     logger.info(
-      { pullNumber, event, commentCount: comments.length, jules },
+      { pullNumber, event, commentCount: comments.length, agent: agent?.name ?? 'none' },
       'PR review created',
     );
   } catch (err) {
-    // If inline comments fail (e.g., line not in diff), fall back to body-only review
     logger.warn({ err }, 'Failed to create review with inline comments, falling back');
     await octokit.pulls.createReview({
       owner,
@@ -87,10 +101,55 @@ export async function createPRReview(
   }
 }
 
+function buildActionPlan(
+  result: ReviewResult,
+  agent: { handle: string; name: string },
+): string {
+  // Order: critical first, then warning. Drop suggestions and nitpicks from
+  // the plan — those go to the inline thread but don't block merge.
+  const ordered = result.annotations
+    .filter((a) => a.severity === 'critical' || a.severity === 'warning')
+    .sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'critical' ? -1 : 1));
+
+  if (ordered.length === 0) return '';
+
+  const lines: string[] = [];
+  lines.push('');
+  lines.push(`### 📋 Action plan for ${agent.handle}`);
+  lines.push('');
+  lines.push(
+    `${agent.name}, complete the items below — critical first, then warning. ` +
+      `Push fixes to the same branch and I will re-review automatically. ` +
+      `If any item genuinely can't be fixed in this PR's scope, leave a yes/no question for me in the PR description (prefix it with \`@kimi\`) and proceed with the rest.`,
+  );
+  lines.push('');
+
+  ordered.forEach((a, i) => {
+    const sev = `${SEVERITY_EMOJI[a.severity]} **[${a.severity}]**`;
+    lines.push(`${i + 1}. ${sev} \`${a.path}:${a.startLine}\` — ${a.title}`);
+    const reason = (a.body || '').split('\n')[0].slice(0, 240).trim();
+    if (reason) lines.push(`   - **Why:** ${reason}`);
+    if (a.suggestedFix) {
+      lines.push(`   - **Suggested fix:**`);
+      lines.push('     ```');
+      for (const fl of a.suggestedFix.split('\n').slice(0, 12)) {
+        lines.push(`     ${fl}`);
+      }
+      if (a.suggestedFix.split('\n').length > 12) {
+        lines.push('     // … (truncated; full diff in the inline comment)');
+      }
+      lines.push('     ```');
+    }
+  });
+
+  lines.push('');
+  return lines.join('\n');
+}
+
 function buildReviewBody(
   result: ReviewResult,
   shouldRequestChanges: boolean,
-  isJules: boolean,
+  agent: { handle: string; name: string } | null,
 ): string {
   const cost = calculateCost(result.tokensUsed);
   const lines: string[] = [];
@@ -108,9 +167,21 @@ function buildReviewBody(
     }
   }
 
-  if (shouldRequestChanges && isJules) {
+  // Action plan only when there's work to do AND we know who's working it.
+  if (shouldRequestChanges && agent) {
+    lines.push(buildActionPlan(result, agent));
+  } else if (shouldRequestChanges && !agent) {
+    // No identified agent — leave a generic line so a human reviewer knows
+    // what to forward this to. Don't tag anyone.
     lines.push('');
-    lines.push('@jules — please address the feedback above. Push fixes to the same branch and Kimi will re-review automatically.');
+    lines.push(
+      `### 📋 Action plan`,
+    );
+    lines.push('');
+    lines.push(
+      'This PR appears to be human-authored (no Jules/Codex/agent signature on the branch or author). ' +
+        'Address the critical and warning annotations above, then push to the same branch — Kimi will re-review automatically.',
+    );
   }
 
   lines.push('');
