@@ -63,7 +63,9 @@ export class KimiClient {
     this.baseUrl = config.baseUrl ?? process.env.KIMI_BASE_URL ?? 'https://api.kimi.com/coding/v1';
     this.maxTokens = config.maxTokens ?? 16384;
     this.temperature = config.temperature ?? 1;
-    this.timeout = config.timeout ?? 300_000;
+    const envTimeout = Number(process.env.KIMI_TIMEOUT_MS);
+    this.timeout =
+      config.timeout ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 900_000);
   }
 
   async chatCompletion(params: {

@@ -147,4 +147,45 @@ That concludes my review.`;
     expect(result.annotations).toHaveLength(0);
     expect(result.tokensUsed).toEqual(usage);
   });
+
+  it('parses JSON inside ```json fence even when content has internal triple-backticks', () => {
+    const raw = '```json\n' +
+      '{\n' +
+      '  "summary": "Found a code-quality issue. Example: ```ts\\nconst x = 1;\\n```",\n' +
+      '  "score": 70,\n' +
+      '  "annotations": []\n' +
+      '}\n' +
+      '```';
+    const result = parseKimiResponse(raw, usage);
+    expect(result.score).toBe(70);
+    expect(result.summary).toContain('code-quality issue');
+  });
+
+  it('recovers from literal newlines inside string values', () => {
+    // LLMs sometimes emit raw newlines inside strings instead of \n — invalid JSON
+    const raw = `\`\`\`json
+{
+  "summary": "Line 1
+Line 2 of summary",
+  "score": 80,
+  "annotations": []
+}
+\`\`\``;
+    const result = parseKimiResponse(raw, usage);
+    expect(result.score).toBe(80);
+    expect(result.summary).toContain('Line 1');
+    expect(result.summary).toContain('Line 2');
+  });
+
+  it('recovers from trailing commas before closing braces', () => {
+    const raw = '{\n  "summary": "ok",\n  "score": 90,\n  "annotations": [],\n}';
+    const result = parseKimiResponse(raw, usage);
+    expect(result.score).toBe(90);
+  });
+
+  it('strips outer fence with leading prose before parsing', () => {
+    const raw = 'Here is my review:\n\n```json\n{"summary":"x","score":42,"annotations":[]}\n```\n\nLet me know!';
+    const result = parseKimiResponse(raw, usage);
+    expect(result.score).toBe(42);
+  });
 });
